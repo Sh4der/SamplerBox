@@ -23,7 +23,10 @@ import sounddevice
 import threading
 from chunk import Chunk
 import struct
-import rtmidi_python as rtmidi
+# import rtmidi_python as rtmidi
+import rtmidi
+from rtmidi.midiutil import open_midiinput
+
 import samplerbox_audio
 
 #########################################
@@ -165,42 +168,51 @@ def AudioCallback(outdata, frame_count, time_info, status):
     b *= globalvolume
     outdata[:] = b.reshape(outdata.shape)
 
-def MidiCallback(message, time_stamp):
-    global playingnotes, sustain, sustainplayingnotes
-    global preset
-    messagetype = message[0] >> 4
-    messagechannel = (message[0] & 15) + 1
-    note = message[1] if len(message) > 1 else None
-    midinote = note
-    velocity = message[2] if len(message) > 2 else None
-    if messagetype == 9 and velocity == 0:
-        messagetype = 8
-    if messagetype == 9:    # Note on
-        midinote += globaltranspose
-        try:
-            playingnotes.setdefault(midinote, []).append(samples[midinote, velocity].play(midinote))
-        except:
-            pass
-    elif messagetype == 8:  # Note off
-        midinote += globaltranspose
-        if midinote in playingnotes:
-            for n in playingnotes[midinote]:
-                if sustain:
-                    sustainplayingnotes.append(n)
-                else:
-                    n.fadeout(50)
-            playingnotes[midinote] = []
-    elif messagetype == 12:  # Program change
-        print('Program change ' + str(note))
-        preset = note
-        LoadSamples()
-    elif (messagetype == 11) and (note == 64) and (velocity < 64):  # sustain pedal off
-        for n in sustainplayingnotes:
-            n.fadeout(50)
-        sustainplayingnotes = []
-        sustain = False
-    elif (messagetype == 11) and (note == 64) and (velocity >= 64):  # sustain pedal on
-        sustain = True
+class MidiInputHandler(object):
+    def __init__(self, port):
+        self.port = port
+        self._wallclock = time.time()
+
+    def __call__(self, event, data=None):
+        message, deltatime = event
+        self._wallclock += deltatime
+        # print("[%s] @%0.6f %r" % (self.port, self._wallclock, message))
+        global playingnotes, sustain, sustainplayingnotes
+        global preset
+        messagetype = message[0] >> 4
+        messagechannel = (message[0] & 15) + 1
+        note = message[1] if len(message) > 1 else None
+        midinote = note
+        velocity = message[2] if len(message) > 2 else None
+        if messagetype == 9 and velocity == 0:
+            messagetype = 8
+        if messagetype == 9:    # Note on
+            midinote += globaltranspose
+            try:
+                playingnotes.setdefault(midinote, []).append(samples[midinote, velocity].play(midinote))
+            except:
+                pass
+        elif messagetype == 8:  # Note off
+            midinote += globaltranspose
+            if midinote in playingnotes:
+                for n in playingnotes[midinote]:
+                    if sustain:
+                        sustainplayingnotes.append(n)
+                    else:
+                        n.fadeout(50)
+                playingnotes[midinote] = []
+        elif messagetype == 12:  # Program change
+            print('Program change ' + str(note))
+            preset = note
+            LoadSamples()
+        elif (messagetype == 11) and (note == 64) and (velocity >= 64):  # sustain pedal off
+            for n in sustainplayingnotes:
+                n.fadeout(50)
+            sustainplayingnotes = []
+            sustain = False
+        elif (messagetype == 11) and (note == 64) and (velocity < 64):  # sustain pedal on
+            sustain = True
+
 
 #########################################
 # LOAD SAMPLES
@@ -314,11 +326,17 @@ def ActuallyLoad():
 #########################################
 
 try:
+    if not AUDIO_DEVICE_ID:
+        out_device_dict = sounddevice.query_devices(kind="output")
+        AUDIO_DEVICE_ID = out_device_dict["index"]
     sd = sounddevice.OutputStream(device=AUDIO_DEVICE_ID, blocksize=512, samplerate=44100, channels=2, dtype='int16', callback=AudioCallback)
     sd.start()
     print('Opened audio device #%i' % AUDIO_DEVICE_ID)
 except:
     print('Invalid audio device #%i' % AUDIO_DEVICE_ID)
+    print(" ")
+    available_devices = sounddevice.query_devices(kind="output")
+    print(f"Here is a list of audio devices: {available_devices}")
     exit(1)
 
 #########################################
@@ -398,7 +416,7 @@ if USE_SERIALPORT_MIDI:
                 if i == 2 and message[0] >> 4 == 12:  # program change: don't wait for a third byte: it has only 2 bytes
                     message[2] = 0
                     i = 3
-            MidiCallback(message, None)
+            # MidiCallback(message, None)
     MidiThread = threading.Thread(target=MidiSerialCallback)
     MidiThread.daemon = True
     MidiThread.start()
@@ -424,14 +442,27 @@ if USE_SYSTEMLED:
 # MAIN LOOP
 #########################################
 
-midi_in = [rtmidi.MidiIn(b'in')]
-previous = []
-while True:
-    for port in midi_in[0].ports:
-        if port not in previous and b'Midi Through' not in port:
-            midi_in.append(rtmidi.MidiIn(b'in'))
-            midi_in[-1].callback = MidiCallback
-            midi_in[-1].open_port(port)
-            print('Opened MIDI: ' + str(port))
-    previous = midi_in[0].ports
-    time.sleep(2)
+
+
+
+try:
+    print(f"open {MIDI_DEVICE}")
+    midiin, port_name = open_midiinput(MIDI_DEVICE)
+except (EOFError, KeyboardInterrupt):
+    exit(1)
+
+print("Attaching MIDI input callback handler.")
+midiin.set_callback(MidiInputHandler(port_name))
+
+print("Entering main loop. Press Control-C to exit.")
+try:
+    # Just wait for keyboard interrupt,
+    # everything else is handled via the input callback.
+    while True:
+        time.sleep(1)
+except KeyboardInterrupt:
+    print('')
+finally:
+    print("Exit.")
+    midiin.close_port()
+    del midiin
